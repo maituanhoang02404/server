@@ -1,31 +1,34 @@
-#!/bin/bash
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import FileResponse
+import os
+import shutil
+import tempfile
 
-echo "Starting server setup..."
+app = FastAPI()
 
-# Cài Python (nếu chưa có, Deepnote thường đã có Python)
-python3 -m venv venv
-source venv/bin/activate
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
 
-# Cập nhật pip và cài các thư viện
-pip install --upgrade pip
-pip install fastapi uvicorn python-multipart moviepy opencv-python Pillow numpy requests
+@app.post("/api/process")
+async def process_images(
+    images: list[UploadFile] = File(...),
+    ai_provider: str = Form("local"),
+    api_key: str = Form("")
+):
+    # Logic xử lý (tạm thời bỏ qua để kiểm tra)
+    return {"message": "Processing started"}
 
-# Tải mã nguồn (giả sử bạn upload thủ công hoặc dùng GitHub)
-if [ ! -d "server_files" ]; then
-    echo "Extracting server files..."
-    unzip server_files.zip -d .
-    mv server_files/* .
-    rm -rf server_files server_files.zip
-fi
+@app.get("/api/download/{session_id}/{filename}")
+async def download_file(session_id: str, filename: str):
+    file_path = os.path.join(UPLOAD_DIR, session_id, filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path, filename=filename)
+    return {"error": "File not found"}
 
-# Cài FFmpeg (tùy chọn, cần kiểm tra hỗ trợ của Deepnote)
-if ! command -v ffmpeg &> /dev/null; then
-    echo "FFmpeg not found. Please install manually or skip if not needed."
-    # Thêm lệnh cài FFmpeg nếu Deepnote hỗ trợ (ví dụ: apt-get install ffmpeg)
-fi
-
-# Chạy server
-echo "Starting server..."
-uvicorn server:app --host 0.0.0.0 --port 5000 --reload &
-
-echo "Setup completed! Server is running at http://localhost:5000"
+@app.post("/api/cleanup/{session_id}")
+async def cleanup(session_id: str):
+    session_dir = os.path.join(UPLOAD_DIR, session_id)
+    if os.path.exists(session_dir):
+        shutil.rmtree(session_dir)
+    return {"status": "cleaned"}
