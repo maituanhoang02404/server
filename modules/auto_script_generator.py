@@ -1,95 +1,65 @@
+# modules/auto_script_generator.py
 import os
-import base64
-import json
-import requests # Thư viện để gọi API của Ollama
-import configparser # Thư viện để đọc file config.ini
-import re 
+import re
+import cv2
+import numpy as np
+import onnxruntime as ort
+from PIL import Image
 
-# --- ĐỌC CẤU HÌNH ---
-config = configparser.ConfigParser()
-config.read('config.ini')
+# Cấu hình YOLOv5-tiny
+MODEL_PATH = "models/yolov5s.onnx"
+CONFIDENCE_THRESHOLD = 0.5
 
-AI_PROVIDER = config.get('AI_Settings', 'provider', fallback='local')
-OPENAI_API_KEY = config.get('AI_Settings', 'openai_api_key', fallback='')
-
-# --- CÁC HÀM XỬ LÝ ---
 def sort_key(filename):
-    """Trích xuất số ở đầu tên file để sắp xếp."""
     match = re.match(r'(\d+)', filename)
     return int(match.group(1)) if match else -1
 
-def encode_image_to_base64(image_path):
-    """Chuyển đổi file ảnh sang định dạng base64."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+def load_yolo_model():
+    session = ort.InferenceSession(MODEL_PATH)
+    return session
 
-def generate_narrative_openai(base64_image):
-    """Gửi ảnh đến OpenAI API và nhận về lời dẫn chuyện."""
-    from openai import OpenAI
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        return "Lỗi: OpenAI API Key không hợp lệ."
+def detect_objects(image_path, session):
+    img = cv2.imread(image_path)
+    if img is None:
+        return []
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (640, 640))  # YOLOv5-tiny yêu cầu kích thước 640x640
+    img = img.transpose((2, 0, 1))  # CHW format
+    img = np.expand_dims(img, axis=0).astype(np.float32) / 255.0
 
-    prompt_messages = [
-        {"role": "user", "content": [
-            {"type": "text", "text": "Bạn là người kể chuyện tóm tắt truyện tranh. Hãy nhìn vào ảnh và mô tả hành động, biểu cảm một cách ngắn gọn, kịch tính (tối đa 2 câu). Đừng mô tả chữ trong ô thoại."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-        ]}
-    ]
-    try:
-        response = client.chat.completions.create(model="gpt-4-vision-preview", messages=prompt_messages, max_tokens=150)
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Lỗi khi gọi OpenAI API: {e}"
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    outputs = session.run([output_name], {input_name: img})
 
-def generate_narrative_local(base64_image):
-    """Gửi ảnh đến Ollama API (local) và nhận về lời dẫn chuyện."""
-    url = "http://localhost:11434/api/generate"
-    payload = {
-        "model": "llava",
-        "prompt": "Mô tả hình ảnh này cho một video tóm tắt truyện tranh. Hãy viết một cách ngắn gọn và kịch tính, tập trung vào hành động và cảm xúc. Bỏ qua mọi văn bản trong ảnh.",
-        "images": [base64_image],
-        "stream": False # Nhận toàn bộ phản hồi trong một lần
-    }
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status() # Báo lỗi nếu request thất bại
-        response_data = response.json()
-        return response_data.get("response", "").strip()
-    except requests.exceptions.ConnectionError:
-        return "Lỗi: Không thể kết nối đến Ollama. Vui lòng đảm bảo Ollama đang chạy."
-    except Exception as e:
-        return f"Lỗi khi gọi Ollama API: {e}"
+    # Giả định đầu ra là bounding boxes, scores, classes (cần điều chỉnh dựa trên YOLO output)
+    detections = outputs[0]
+    boxes = detections[0][:, :4]  # x1, y1, x2, y2
+    scores = detections[0][:, 4]
+    classes = detections[0][:, 5].astype(np.int32)
 
-def generate_narrative_for_image(image_path):
-    """Hàm trung gian để chọn nhà cung cấp AI phù hợp."""
-    base64_image = encode_image_to_base64(image_path)
-    
-    if AI_PROVIDER == 'openai' and OPENAI_API_KEY:
-        print("-> Sử dụng OpenAI API (Trả phí)...")
-        return generate_narrative_openai(base64_image)
-    else:
-        print("-> Sử dụng Local AI (Miễn phí)...")
-        return generate_narrative_local(base64_image)
+    detected_objects = []
+    for box, score, cls in zip(boxes, scores, classes):
+        if score > CONFIDENCE_THRESHOLD:
+            detected_objects.append({"class": cls, "score": score})
+    return detected_objects
+
+def generate_narrative_rule_based(image_path, image_index, detected_objects):
+    if not detected_objects:
+        return f"Cảnh {image_index + 1}: Một khoảnh khắc bí ẩn!"
+    obj_names = {0: "người", 1: "vật thể", 2: "vũ khí"}  # Tùy chỉnh danh sách lớp theo YOLO
+    objects = [obj_names.get(obj["class"], "đối tượng") for obj in detected_objects]
+    return f"Cảnh {image_index + 1}: {', '.join(objects)} xuất hiện trong trận chiến kịch tính!"
 
 def create_full_script(image_folder, ai_provider, api_key, log_callback):
-    # THAY ĐỔI Ở ĐÂY: Sử dụng hàm sort_key mới
     image_files = sorted([f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))],
                          key=sort_key)
-
+    session = load_yolo_model()
     full_script = []
-    
-    for filename in image_files:
+    for index, filename in enumerate(image_files):
         image_path = os.path.join(image_folder, filename)
-        print(f"Đang tạo kịch bản cho ảnh: {filename}...")
-        narrative = generate_narrative_for_image(image_path)
+        log_callback(f"Đang tạo kịch bản cho ảnh: {filename}...")
+        detected_objects = detect_objects(image_path, session)
+        narrative = generate_narrative_rule_based(image_path, index, detected_objects)
         full_script.append(narrative)
-        print(f"   Kịch bản: {narrative}")
-
-    final_script_content = "\n---\n".join(full_script)
-    
-    with open(output_script_file, 'w', encoding='utf-8') as f:
-        f.write(final_script_content)
-    
-    print(f"\nKịch bản tự động đã được lưu tại: {output_script_file}")
+        log_callback(f"   Kịch bản: {narrative}")
+    return "\n---\n".join(full_script)
